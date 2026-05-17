@@ -532,6 +532,19 @@ def main():
     # generate-sample
     sub.add_parser("generate-sample", help="Generate sample Buff City Soap-style data")
 
+    # ask (conversational agent)
+    ask_parser = sub.add_parser("ask", help="Ask a question in natural language (uses Claude)")
+    ask_parser.add_argument("question", help="Your question about the data")
+
+    # similar (fragrance similarity)
+    sim_parser = sub.add_parser("similar", help="Find similar fragrances using embeddings")
+    sim_parser.add_argument("fragrance", help="Fragrance name to find neighbors for")
+    sim_parser.add_argument("--top", type=int, default=10, help="Number of results")
+    sim_parser.add_argument("--threshold", type=float, default=0.3, help="Min similarity (0-1)")
+
+    # embed (build/rebuild embedding cache)
+    sub.add_parser("embed", help="Build/rebuild fragrance embedding cache")
+
     args = parser.parse_args()
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -561,6 +574,30 @@ def main():
         show_templates()
     elif args.command == "shell":
         interactive_shell()
+    elif args.command == "ask":
+        from .embeddings import FragranceEmbedder
+        from .agent import run_agent
+        embedder = FragranceEmbedder()
+        run_agent(args.question, embedder=embedder)
+    elif args.command == "similar":
+        from .embeddings import FragranceEmbedder
+        embedder = FragranceEmbedder()
+        results = embedder.find_similar(args.fragrance, top_n=args.top, threshold=args.threshold)
+        if not results:
+            print(f"  Fragrance '{args.fragrance}' not found in taxonomy.")
+        else:
+            print(f"\n  Fragrances similar to '{args.fragrance}':")
+            print(f"  {'─' * 50}")
+            for name, score, family in results:
+                bar = '█' * int(score * 20)
+                print(f"  {score:.3f} {bar:20s} {name} ({family})")
+    elif args.command == "embed":
+        from .embeddings import FragranceEmbedder
+        embedder = FragranceEmbedder(use_cache=False)
+        stats = embedder.stats()
+        print(f"  Embedded {stats['total_fragrances']} fragrances ({stats['embedding_dim']}d)")
+        print(f"  Families: {', '.join(stats['families'])}")
+        print(f"  Cache: {stats['cache_file']}")
     elif args.command == "generate-sample":
         generate_sample()
     else:
