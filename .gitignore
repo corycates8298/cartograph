@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 *.npz
+
+# Generated certification artifacts (re-emitted on every certify.py run)
+cartograph_harness/certificates/

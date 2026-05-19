@@ -4,6 +4,7 @@ Embeds scent note profiles (not names) into vector space.
 Precomputes cosine similarity matrix for instant lookups.
 """
 
+import hashlib
 import json
 import numpy as np
 from pathlib import Path
@@ -18,17 +19,60 @@ SIMILARITY_FILE = CACHE_DIR / "fragrance_similarity.json"
 MODEL_NAME = "all-MiniLM-L6-v2"  # 384-dim, 22M params, <100MB
 
 
+# ── Cache-staleness detection (ChatGPT 2026-05-19 negative control) ────
+#
+# Trap: catalog adds a new fragrance (e.g. "Lemon Lavender") but no one
+# runs `cartograph embed`. The next similarity query silently uses
+# embeddings that don't include the new fragrance — answers are wrong
+# without warning. Fix: hash the canonical taxonomy at build time, store
+# the hash in the cache, and refuse to load a cache whose hash differs
+# from the current taxonomy.
+
+
+def taxonomy_hash(taxonomy: dict | None = None) -> str:
+    """Canonical SHA-256 of the fragrance taxonomy.
+
+    Stable across runs because we sort keys and serialize with no
+    whitespace variation. Same taxonomy → same hash, every time.
+    """
+    if taxonomy is None:
+        taxonomy = FRAGRANCE_TAXONOMY
+    canonical = json.dumps(taxonomy, sort_keys=True, separators=(",", ":"),
+                            ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+class StaleEmbeddingCacheError(RuntimeError):
+    """Raised when the cached embedding index doesn't match the current
+    taxonomy. Caller must rebuild via FragranceEmbedder(use_cache=False)
+    or `cartograph embed`."""
+
+
 class FragranceEmbedder:
     """Manages fragrance embeddings and similarity lookups."""
 
-    def __init__(self, use_cache=True):
+    def __init__(self, use_cache=True, strict_cache=True):
+        """Build or load fragrance embeddings.
+
+        strict_cache (default True): if the on-disk cache's taxonomy_hash
+        doesn't match the current taxonomy, raise StaleEmbeddingCacheError
+        instead of silently using stale vectors. Pass False to force-load
+        anyway (developer debugging only — never in agent path)."""
         self.names = []
         self.embeddings = None
         self.similarity_matrix = None
+        self.cache_taxonomy_hash = None
         self._model = None
 
         if use_cache and CACHE_FILE.exists():
             self._load_cache()
+            if strict_cache and self.is_stale():
+                raise StaleEmbeddingCacheError(
+                    f"embedding cache hash {self.cache_taxonomy_hash[:16]}... "
+                    f"does not match current taxonomy hash "
+                    f"{taxonomy_hash()[:16]}.... Run `cartograph embed` to "
+                    f"rebuild before continuing."
+                )
         else:
             self._build()
 
@@ -56,13 +100,18 @@ class FragranceEmbedder:
         print(f"  Done. Cached to {CACHE_FILE}")
 
     def _save_cache(self):
-        """Save embeddings to disk."""
+        """Save embeddings to disk along with the taxonomy hash that
+        produced them. The hash is the cache's integrity check —
+        _load_cache reads it and is_stale() compares against the
+        current taxonomy."""
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        self.cache_taxonomy_hash = taxonomy_hash()
         np.savez_compressed(
             CACHE_FILE,
             names=np.array(self.names),
             embeddings=self.embeddings,
             similarity_matrix=self.similarity_matrix,
+            taxonomy_hash=np.array(self.cache_taxonomy_hash),
         )
 
         # Also save human-readable similarity JSON
@@ -86,11 +135,23 @@ class FragranceEmbedder:
             json.dump(sim_data, f, indent=2)
 
     def _load_cache(self):
-        """Load cached embeddings."""
+        """Load cached embeddings + the taxonomy hash that produced them."""
         data = np.load(CACHE_FILE, allow_pickle=True)
         self.names = list(data["names"])
         self.embeddings = data["embeddings"]
         self.similarity_matrix = data["similarity_matrix"]
+        # Pre-2026-05-19 caches don't have taxonomy_hash — treat as stale
+        if "taxonomy_hash" in data.files:
+            self.cache_taxonomy_hash = str(data["taxonomy_hash"])
+        else:
+            self.cache_taxonomy_hash = None
+
+    def is_stale(self) -> bool:
+        """True if the loaded cache hash differs from the current taxonomy
+        hash. Caller must rebuild before trusting similarity results."""
+        if self.cache_taxonomy_hash is None:
+            return True
+        return self.cache_taxonomy_hash != taxonomy_hash()
 
     def find_similar(self, fragrance_name, top_n=5, threshold=0.0):
         """

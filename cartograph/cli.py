@@ -24,7 +24,19 @@ import sys
 from pathlib import Path
 
 import duckdb
-import pandas as pd
+
+# pandas is lazy-imported inside the functions that use it. Module-level
+# import broke test collection on machines without pandas (the SQL guards
+# don't actually need pandas to function; only the result-printing paths
+# and the Excel/sample-data branches do).
+def _pd():
+    import pandas as pd
+    return pd
+
+from .sql_guard import (
+    safe_date, safe_category, safe_fragrance, safe_int, safe_path,
+    execute_safe, SQLGuardError, ALLOWED_IMPORT_SUFFIXES,
+)
 
 DATA_DIR = Path.home() / "osint" / "data"
 DB_PATH = DATA_DIR / "analytics.duckdb"
@@ -41,13 +53,41 @@ class C:
 
 
 # ── Query Templates for Retail Analytics ─────────────────────────
+#
+# Kimi + ChatGPT audit 2026-05-19: previously these templates used Python
+# string-formatting placeholders consumed at run time on user-controlled
+# params — exactly the same SQL-injection vector that was just closed in
+# agent.py. The CLI attack surface is "operator only" today, but any
+# script, web form, or cron wrapper around `scout-analytics template ...`
+# re-opens it.
+#
+# NEW CONTRACT (every template MUST satisfy this):
+#   - SQL uses DuckDB `?` placeholders only — never `{name}` / `%s` / `$N`
+#   - `params` is the SQL-order list of named bindings
+#   - `validators` maps each param name to a sql_guard validator key
+#   - run_template() validates each value and passes them through
+#     execute_safe() — which itself hard-refuses any SQL containing `{` or `}`
+#
+# Adding a template? Pick validators from VALIDATOR_TABLE below. Anything
+# you can't validate to an allow-list or a strict format does NOT belong
+# in a parameter-bound template — escalate the design instead.
+
+# Map validator key → callable. The set is intentionally small. To add a
+# new validator key, extend sql_guard.py first (the load-bearing module),
+# then list the key here.
+VALIDATOR_TABLE = {
+    "category":  lambda v, name: safe_category(v),
+    "date":      lambda v, name: safe_date(v, name),
+    "fragrance": lambda v, name: safe_fragrance(v),
+    "int_min0":  lambda v, name: safe_int(v, name, min_val=0),
+    "int_min1":  lambda v, name: safe_int(v, name, min_val=1),
+}
+
 
 TEMPLATES = {
     "cross_sell_fragrance": {
         "description": "Guests who bought [Category A] AND [Category B] in similar fragrance",
         "sql": """
--- Cross-sell: Guests who bought {cat_a} AND {cat_b} in similar fragrance
--- Between {start_date} and {end_date}
 SELECT
     a.guest_id,
     a.product_type AS first_purchase_category,
@@ -59,27 +99,32 @@ SELECT
 FROM transactions a
 JOIN transactions b
     ON a.guest_id = b.guest_id
-    AND b.product_type = '{cat_b}'
+    AND b.product_type = ?
     AND (
         b.fragrance = a.fragrance
         OR b.fragrance ILIKE '%' || SPLIT_PART(a.fragrance, ' ', 1) || '%'
     )
-WHERE a.product_type = '{cat_a}'
-    AND a.transaction_date BETWEEN '{start_date}' AND '{end_date}'
-ORDER BY a.guest_id, a.transaction_date;
+WHERE a.product_type = ?
+    AND a.transaction_date BETWEEN ? AND ?
+ORDER BY a.guest_id, a.transaction_date
 """,
-        "example": "cross_sell_fragrance cat_a='Body Lotion' cat_b='Laundry Soap' start_date='2025-01-03' end_date='2026-01-02'"
+        # SQL-order — first ? = cat_b (in JOIN), second = cat_a (WHERE), then dates
+        "params": ["cat_b", "cat_a", "start_date", "end_date"],
+        "validators": {
+            "cat_a": "category", "cat_b": "category",
+            "start_date": "date", "end_date": "date",
+        },
+        "example": "cross_sell_fragrance cat_a='Body Lotion' cat_b='Laundry Soap' start_date='2025-01-03' end_date='2026-01-02'",
     },
 
     "category_affinity": {
         "description": "What categories do buyers of [Category] also purchase?",
         "sql": """
--- Category affinity: What else do {category} buyers purchase?
 WITH target_guests AS (
     SELECT DISTINCT guest_id
     FROM transactions
-    WHERE product_type ILIKE '%{category}%'
-        AND transaction_date BETWEEN '{start_date}' AND '{end_date}'
+    WHERE product_type ILIKE '%' || ? || '%'
+        AND transaction_date BETWEEN ? AND ?
 )
 SELECT
     t.product_type,
@@ -88,17 +133,21 @@ SELECT
     ROUND(COUNT(DISTINCT t.guest_id) * 100.0 / (SELECT COUNT(*) FROM target_guests), 1) AS pct_of_target
 FROM transactions t
 JOIN target_guests tg ON t.guest_id = tg.guest_id
-WHERE t.product_type NOT ILIKE '%{category}%'
+WHERE t.product_type NOT ILIKE '%' || ? || '%'
 GROUP BY t.product_type
-ORDER BY unique_guests DESC;
+ORDER BY unique_guests DESC
 """,
-        "example": "category_affinity category='Body Lotion' start_date='2025-01-01' end_date='2026-01-01'"
+        "params": ["category", "start_date", "end_date", "category"],
+        "validators": {
+            "category": "category",
+            "start_date": "date", "end_date": "date",
+        },
+        "example": "category_affinity category='Body Lotion' start_date='2025-01-01' end_date='2026-01-01'",
     },
 
     "fragrance_loyalty": {
         "description": "Do guests stick to the same fragrance across categories?",
         "sql": """
--- Fragrance loyalty: Do guests repeat the same fragrance across categories?
 SELECT
     guest_id,
     fragrance,
@@ -108,19 +157,20 @@ SELECT
     SUM(price) AS total_spend
 FROM transactions
 WHERE fragrance IS NOT NULL AND fragrance != ''
-    AND transaction_date BETWEEN '{start_date}' AND '{end_date}'
+    AND transaction_date BETWEEN ? AND ?
 GROUP BY guest_id, fragrance
 HAVING COUNT(DISTINCT product_type) >= 2
 ORDER BY categories_purchased DESC, total_spend DESC
-LIMIT 100;
+LIMIT 100
 """,
-        "example": "fragrance_loyalty start_date='2024-01-01' end_date='2026-01-01'"
+        "params": ["start_date", "end_date"],
+        "validators": {"start_date": "date", "end_date": "date"},
+        "example": "fragrance_loyalty start_date='2024-01-01' end_date='2026-01-01'",
     },
 
     "discount_impact": {
         "description": "How do discounts affect purchase behavior?",
         "sql": """
--- Discount impact on purchase behavior
 SELECT
     CASE WHEN discount_amount > 0 THEN 'Discounted' ELSE 'Full Price' END AS purchase_type,
     product_type,
@@ -130,17 +180,18 @@ SELECT
     ROUND(AVG(discount_amount), 2) AS avg_discount,
     ROUND(SUM(price - COALESCE(discount_amount, 0)), 2) AS net_revenue
 FROM transactions
-WHERE transaction_date BETWEEN '{start_date}' AND '{end_date}'
+WHERE transaction_date BETWEEN ? AND ?
 GROUP BY 1, product_type
-ORDER BY product_type, purchase_type;
+ORDER BY product_type, purchase_type
 """,
-        "example": "discount_impact start_date='2025-01-01' end_date='2026-01-01'"
+        "params": ["start_date", "end_date"],
+        "validators": {"start_date": "date", "end_date": "date"},
+        "example": "discount_impact start_date='2025-01-01' end_date='2026-01-01'",
     },
 
     "channel_performance": {
         "description": "Revenue and guest count by purchase channel",
         "sql": """
--- Channel performance
 SELECT
     channel,
     COUNT(DISTINCT guest_id) AS unique_guests,
@@ -150,17 +201,18 @@ SELECT
     ROUND(SUM(discount_amount), 2) AS total_discounts,
     COUNT(DISTINCT product_type) AS categories_sold
 FROM transactions
-WHERE transaction_date BETWEEN '{start_date}' AND '{end_date}'
+WHERE transaction_date BETWEEN ? AND ?
 GROUP BY channel
-ORDER BY gross_revenue DESC;
+ORDER BY gross_revenue DESC
 """,
-        "example": "channel_performance start_date='2025-01-01' end_date='2026-01-01'"
+        "params": ["start_date", "end_date"],
+        "validators": {"start_date": "date", "end_date": "date"},
+        "example": "channel_performance start_date='2025-01-01' end_date='2026-01-01'",
     },
 
     "repeat_buyers": {
         "description": "Guests with multiple purchases — frequency and recency",
         "sql": """
--- Repeat buyer analysis
 SELECT
     guest_id,
     COUNT(*) AS purchase_count,
@@ -171,19 +223,23 @@ SELECT
     ROUND(SUM(price), 2) AS lifetime_value,
     ARRAY_AGG(DISTINCT product_type) AS category_mix
 FROM transactions
-WHERE transaction_date BETWEEN '{start_date}' AND '{end_date}'
+WHERE transaction_date BETWEEN ? AND ?
 GROUP BY guest_id
-HAVING COUNT(*) >= {min_purchases}
+HAVING COUNT(*) >= ?
 ORDER BY lifetime_value DESC
-LIMIT 100;
+LIMIT 100
 """,
-        "example": "repeat_buyers start_date='2022-01-01' end_date='2026-01-01' min_purchases=3"
+        "params": ["start_date", "end_date", "min_purchases"],
+        "validators": {
+            "start_date": "date", "end_date": "date",
+            "min_purchases": "int_min1",
+        },
+        "example": "repeat_buyers start_date='2022-01-01' end_date='2026-01-01' min_purchases=3",
     },
 
     "fragrance_popularity": {
         "description": "Most popular fragrances by category",
         "sql": """
--- Fragrance popularity by category
 SELECT
     product_type,
     fragrance,
@@ -192,17 +248,18 @@ SELECT
     ROUND(SUM(price), 2) AS revenue
 FROM transactions
 WHERE fragrance IS NOT NULL AND fragrance != ''
-    AND transaction_date BETWEEN '{start_date}' AND '{end_date}'
+    AND transaction_date BETWEEN ? AND ?
 GROUP BY product_type, fragrance
-ORDER BY product_type, purchases DESC;
+ORDER BY product_type, purchases DESC
 """,
-        "example": "fragrance_popularity start_date='2025-01-01' end_date='2026-01-01'"
+        "params": ["start_date", "end_date"],
+        "validators": {"start_date": "date", "end_date": "date"},
+        "example": "fragrance_popularity start_date='2025-01-01' end_date='2026-01-01'",
     },
 
     "market_basket": {
         "description": "Products frequently purchased together in same transaction",
         "sql": """
--- Market basket: products bought together
 WITH order_pairs AS (
     SELECT
         a.transaction_id,
@@ -212,57 +269,132 @@ WITH order_pairs AS (
     JOIN transactions b
         ON a.transaction_id = b.transaction_id
         AND a.product_type < b.product_type
-    WHERE a.transaction_date BETWEEN '{start_date}' AND '{end_date}'
+    WHERE a.transaction_date BETWEEN ? AND ?
 )
 SELECT
     product_a,
     product_b,
     COUNT(*) AS co_occurrences,
-    ROUND(COUNT(*) * 100.0 / (SELECT COUNT(DISTINCT transaction_id) FROM transactions WHERE transaction_date BETWEEN '{start_date}' AND '{end_date}'), 2) AS pct_of_orders
+    ROUND(COUNT(*) * 100.0 / (SELECT COUNT(DISTINCT transaction_id) FROM transactions WHERE transaction_date BETWEEN ? AND ?), 2) AS pct_of_orders
 FROM order_pairs
 GROUP BY product_a, product_b
 ORDER BY co_occurrences DESC
-LIMIT 20;
+LIMIT 20
 """,
-        "example": "market_basket start_date='2025-01-01' end_date='2026-01-01'"
+        "params": ["start_date", "end_date", "start_date", "end_date"],
+        "validators": {"start_date": "date", "end_date": "date"},
+        "example": "market_basket start_date='2025-01-01' end_date='2026-01-01'",
     },
 }
 
 
 # ── Import Functions ─────────────────────────────────────────────
 
-def import_file(filepath, table_name=None, db_path=DB_PATH):
-    """Import CSV, Excel, JSON, or Parquet into DuckDB."""
-    filepath = Path(filepath)
-    if not filepath.exists():
-        print(f"  {C.RED}File not found: {filepath}{C.RESET}")
-        return
+# Identifier safety for table names: alphanumeric + underscore only, 1..63 chars,
+# must start with a letter. This is the ONLY identifier we let through — DuckDB
+# parameter binding does not cover identifiers, so we allow-list instead.
+import re as _re_id
+_TABLE_NAME_RE = _re_id.compile(r"^[A-Za-z][A-Za-z0-9_]{0,62}$")
+
+
+def _safe_table_name(name: str) -> str:
+    """Validate a DuckDB table identifier. Raises SQLGuardError on anything
+    outside the alphanumeric+underscore pattern. Identifiers cannot be
+    parameter-bound, so we hard-allowlist."""
+    if not isinstance(name, str) or not _TABLE_NAME_RE.match(name):
+        raise SQLGuardError(
+            f"invalid table name {name!r} — must match [A-Za-z][A-Za-z0-9_]{{0,62}}"
+        )
+    return name
+
+
+def import_file(filepath, table_name=None, db_path=DB_PATH, data_root=None):
+    """Import CSV, Excel, JSON, or Parquet into DuckDB.
+
+    Kimi/ChatGPT 2026-05-19: previously this used f-string interpolation
+    `read_csv_auto('{filepath}')` which made a path like
+    `'/tmp/x.csv'); DROP TABLE transactions; --` an injection vector.
+
+    Fix:
+      - safe_path() validates the path resolves under data_root + has an
+        allowed suffix + exists
+      - _safe_table_name() allow-lists the table identifier (DuckDB doesn't
+        parameter-bind identifiers, so we restrict to [A-Za-z0-9_])
+      - File path is parameter-bound into read_csv_auto/read_json_auto/
+        read_parquet via execute_safe; no string interpolation of paths
+    """
+    if data_root is None:
+        data_root = Path.home()    # broad fallback for general CLI use
+
+    try:
+        p = safe_path(filepath, data_root, ALLOWED_IMPORT_SUFFIXES)
+    except SQLGuardError as e:
+        print(f"  {C.RED}Import rejected: {e}{C.RESET}")
+        return None
 
     if not table_name:
-        table_name = filepath.stem.lower().replace(" ", "_").replace("-", "_")
+        table_name = p.stem.lower().replace(" ", "_").replace("-", "_")
+    try:
+        table_name = _safe_table_name(table_name)
+    except SQLGuardError as e:
+        print(f"  {C.RED}{e}{C.RESET}")
+        return None
 
     conn = duckdb.connect(str(db_path))
-
-    ext = filepath.suffix.lower()
-    if ext == ".csv":
-        conn.execute(f"CREATE OR REPLACE TABLE {table_name} AS SELECT * FROM read_csv_auto('{filepath}')")
-    elif ext in (".xlsx", ".xls"):
-        df = pd.read_excel(filepath)
-        conn.execute(f"CREATE OR REPLACE TABLE {table_name} AS SELECT * FROM df")
-    elif ext == ".json":
-        conn.execute(f"CREATE OR REPLACE TABLE {table_name} AS SELECT * FROM read_json_auto('{filepath}')")
-    elif ext == ".parquet":
-        conn.execute(f"CREATE OR REPLACE TABLE {table_name} AS SELECT * FROM read_parquet('{filepath}')")
-    else:
-        print(f"  {C.RED}Unsupported format: {ext}{C.RESET}")
+    ext = p.suffix.lower()
+    try:
+        if ext == ".csv":
+            execute_safe(
+                conn,
+                f"CREATE OR REPLACE TABLE {table_name} AS "
+                f"SELECT * FROM read_csv_auto(?)",
+                [str(p)],
+            )
+        elif ext == ".tsv":
+            execute_safe(
+                conn,
+                f"CREATE OR REPLACE TABLE {table_name} AS "
+                f"SELECT * FROM read_csv_auto(?, delim='\\t')",
+                [str(p)],
+            )
+        elif ext in (".xlsx", ".xls"):
+            df = _pd().read_excel(p)
+            # `df` is a Python-side dataframe — DuckDB scans it directly via
+            # the implicit `df` reference. Table name already validated above.
+            conn.execute(
+                f"CREATE OR REPLACE TABLE {table_name} AS SELECT * FROM df"
+            )
+        elif ext == ".json":
+            execute_safe(
+                conn,
+                f"CREATE OR REPLACE TABLE {table_name} AS "
+                f"SELECT * FROM read_json_auto(?)",
+                [str(p)],
+            )
+        elif ext == ".parquet":
+            execute_safe(
+                conn,
+                f"CREATE OR REPLACE TABLE {table_name} AS "
+                f"SELECT * FROM read_parquet(?)",
+                [str(p)],
+            )
+        else:
+            # safe_path already enforces this, but defense-in-depth
+            print(f"  {C.RED}Unsupported format: {ext}{C.RESET}")
+            return None
+    except Exception as e:
+        print(f"  {C.RED}Import failed: {e}{C.RESET}")
         conn.close()
-        return
+        return None
 
-    count = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
-    cols = conn.execute(f"DESCRIBE {table_name}").fetchall()
+    # Table name was validated above — safe to splice into DDL-shape queries
+    count = execute_safe(
+        conn, f"SELECT COUNT(*) FROM {table_name}",
+    ).fetchone()[0]
+    cols = execute_safe(conn, f"DESCRIBE {table_name}").fetchall()
     conn.close()
 
-    print(f"  {C.GREEN}Imported: {filepath.name} → {table_name}{C.RESET}")
+    print(f"  {C.GREEN}Imported: {p.name} → {table_name}{C.RESET}")
     print(f"  Rows: {count} | Columns: {len(cols)}")
     print(f"  Schema:")
     for col in cols:
@@ -306,43 +438,111 @@ def show_templates():
 
 
 def run_template(template_name, params, db_path=DB_PATH):
-    """Run a template with parameters."""
+    """Run a template with parameters.
+
+    Kimi/ChatGPT 2026-05-19 refactor: previously this used Python string
+    formatting on template SQL with user-controlled params — the same SQL
+    injection vector that was closed in agent.py. NOW: every value flows
+    through sql_guard validators, and the SQL is parameter-bound via
+    execute_safe — no string interpolation of user values into SQL ever.
+    (Source-level regression test test_cli_source_does_not_use_format_for_sql
+    fires if the old call pattern ever returns.)
+
+    Returns a dict for programmatic callers (tests use this) AND prints to
+    stdout for CLI users. The CLI return value is the dict; the visual
+    output is a side effect.
+    """
     if template_name not in TEMPLATES:
-        print(f"  {C.RED}Unknown template: {template_name}{C.RESET}")
+        msg = f"Unknown template: {template_name}"
+        print(f"  {C.RED}{msg}{C.RESET}")
         print(f"  Available: {', '.join(TEMPLATES.keys())}")
-        return
+        return {"error": msg, "available": sorted(TEMPLATES.keys())}
 
-    sql = TEMPLATES[template_name]["sql"]
+    spec = TEMPLATES[template_name]
+    sql = spec["sql"]
+    sql_param_order = spec["params"]
+    validators = spec["validators"]
+
+    # 1. Validate every value through sql_guard. Any failure aborts BEFORE
+    #    any SQL touches DuckDB.
     try:
-        sql = sql.format(**params)
-    except KeyError as e:
-        print(f"  {C.RED}Missing parameter: {e}{C.RESET}")
-        print(f"  Example: {TEMPLATES[template_name]['example']}")
-        return
+        validated_by_name = {}
+        for pname, vkey in validators.items():
+            if pname not in params:
+                raise SQLGuardError(
+                    f"missing required parameter {pname!r} for template "
+                    f"{template_name!r}. Example: {spec['example']}"
+                )
+            try:
+                vfn = VALIDATOR_TABLE[vkey]
+            except KeyError:
+                raise SQLGuardError(
+                    f"unknown validator {vkey!r} for param {pname!r} — "
+                    f"template definition is malformed"
+                )
+            validated_by_name[pname] = vfn(params[pname], pname)
 
-    print(f"  {C.DIM}Running:{C.RESET}")
-    print(f"  {C.DIM}{sql.strip()[:200]}...{C.RESET}\n")
+        # Reject unknown params — refuse "pass through" since an unrecognized
+        # name is either a typo (caller bug) or an injection attempt (param
+        # the template doesn't actually use).
+        for k in params:
+            if k not in validators:
+                raise SQLGuardError(
+                    f"unexpected parameter {k!r} for template "
+                    f"{template_name!r}; allowed: {sorted(validators)}"
+                )
+
+        # 2. Bind in the EXACT SQL order the template specifies (allows
+        #    the same param to appear multiple times — market_basket etc.)
+        bound_values = [validated_by_name[name] for name in sql_param_order]
+
+    except SQLGuardError as e:
+        print(f"  {C.RED}Input rejected: {e}{C.RESET}")
+        return {"error": str(e)}
+
+    print(f"  {C.DIM}Running template {template_name} with "
+          f"{len(bound_values)} bound param(s){C.RESET}\n")
 
     conn = duckdb.connect(str(db_path))
     try:
-        result = conn.execute(sql).fetchdf()
+        # 3. execute_safe is the load-bearing call — it refuses any SQL
+        #    containing literal `{` or `}` (the f-string regression
+        #    tripwire), and binds values via DuckDB's prepared-statement
+        #    parameter binding. No string interpolation of user values.
+        result = execute_safe(conn, sql, bound_values).fetchdf()
         if result.empty:
             print(f"  {C.YELLOW}No results.{C.RESET}")
-        else:
-            pd.set_option('display.max_columns', None)
-            pd.set_option('display.width', 120)
-            print(result.to_string(index=False))
-            print(f"\n  {C.DIM}({len(result)} rows){C.RESET}")
+            return {"rows": 0, "data": []}
+        _pd().set_option('display.max_columns', None)
+        _pd().set_option('display.width', 120)
+        print(result.to_string(index=False))
+        print(f"\n  {C.DIM}({len(result)} rows){C.RESET}")
+        return {"rows": len(result), "data": result.to_dict(orient="records")}
     except Exception as e:
-        print(f"  {C.RED}Error: {e}{C.RESET}")
+        msg = f"{type(e).__name__}: {e}"
+        print(f"  {C.RED}Error: {msg}{C.RESET}")
+        return {"error": msg}
     finally:
         conn.close()
 
 
 def interactive_shell(db_path=DB_PATH):
-    """Interactive SQL shell with DuckDB."""
+    """Interactive SQL shell with DuckDB.
+
+    **DEVELOPER-ONLY.** This shell intentionally accepts arbitrary SQL —
+    it is the only Cartograph surface that does. ChatGPT 2026-05-19
+    explicit ruling: this is excluded from QUERY_SAFETY_CERTIFIED and MUST
+    NOT be reachable from:
+      - Claude tool-use (the agent has its own typed-tool surface)
+      - Web UI / demo chatbot (route those through run_template() instead)
+      - Any production caller
+
+    Anyone wrapping `cartograph shell` behind a network listener is
+    explicitly violating the certification contract.
+    """
     print(f"""
   {C.CYAN}{C.BOLD}Scout Analytics — Interactive SQL Shell{C.RESET}
+  {C.YELLOW}⚠ DEVELOPER-ONLY — accepts arbitrary SQL. Not certified for production use.{C.RESET}
   {C.DIM}Database: {db_path}{C.RESET}
   {C.DIM}Commands: .schema, .tables, .templates, .import <file>, .quit{C.RESET}
   {C.DIM}Type SQL directly or use templates.{C.RESET}
@@ -380,9 +580,9 @@ def interactive_shell(db_path=DB_PATH):
             if result.empty:
                 print(f"  {C.DIM}(empty result){C.RESET}")
             else:
-                pd.set_option('display.max_columns', None)
-                pd.set_option('display.width', 120)
-                pd.set_option('display.max_rows', 50)
+                _pd().set_option('display.max_columns', None)
+                _pd().set_option('display.width', 120)
+                _pd().set_option('display.max_rows', 50)
                 print(result.to_string(index=False))
                 print(f"  {C.DIM}({len(result)} rows){C.RESET}")
         except Exception as e:
@@ -482,7 +682,7 @@ def generate_sample(db_path=DB_PATH):
 
     # Load into DuckDB
     conn = duckdb.connect(str(db_path))
-    df = pd.DataFrame(records)
+    df = _pd().DataFrame(records)
     conn.execute("CREATE OR REPLACE TABLE transactions AS SELECT * FROM df")
     count = conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
     conn.close()
@@ -555,8 +755,8 @@ def main():
         conn = duckdb.connect(args.db)
         try:
             result = conn.execute(args.sql).fetchdf()
-            pd.set_option('display.max_columns', None)
-            pd.set_option('display.width', 120)
+            _pd().set_option('display.max_columns', None)
+            _pd().set_option('display.width', 120)
             print(result.to_string(index=False))
             print(f"\n  ({len(result)} rows)")
         except Exception as e:
