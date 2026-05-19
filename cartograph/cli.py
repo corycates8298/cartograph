@@ -86,7 +86,12 @@ VALIDATOR_TABLE = {
 
 TEMPLATES = {
     "cross_sell_fragrance": {
-        "description": "Guests who bought [Category A] AND [Category B] in similar fragrance",
+        "description": (
+            "Guests who bought [Category A] AND [Category B] in the EXACT "
+            "same fragrance. For embedding-based similarity cross-sell "
+            "(e.g., Lavender ≈ French Lavender), use `cartograph ask` — "
+            "the agent's cross_sell_analysis tool uses the real embedder."
+        ),
         "sql": """
 SELECT
     a.guest_id,
@@ -100,15 +105,20 @@ FROM transactions a
 JOIN transactions b
     ON a.guest_id = b.guest_id
     AND b.product_type = ?
-    AND (
-        b.fragrance = a.fragrance
-        OR b.fragrance ILIKE '%' || SPLIT_PART(a.fragrance, ' ', 1) || '%'
-    )
+    AND b.fragrance = a.fragrance
 WHERE a.product_type = ?
     AND a.transaction_date BETWEEN ? AND ?
 ORDER BY a.guest_id, a.transaction_date
 """,
-        # SQL-order — first ? = cat_b (in JOIN), second = cat_a (WHERE), then dates
+        # ChatGPT 2026-05-19 backlog: previous template used
+        #   `b.fragrance ILIKE '%' || SPLIT_PART(a.fragrance, ' ', 1) || '%'`
+        # which is name-token matching — directly contradicts Cartograph's
+        # embedding-similarity pitch. ('Lavender' would fuzz-match 'Lavender
+        # Lace' purely on shared name token, regardless of scent profile.)
+        # Removed. The CLI template now does deterministic exact-match;
+        # semantic similarity lives in the agent path where the embedder
+        # actually loads. This makes the CLI template honest about what
+        # it does — name token matching was never the design intent.
         "params": ["cat_b", "cat_a", "start_date", "end_date"],
         "validators": {
             "cat_a": "category", "cat_b": "category",

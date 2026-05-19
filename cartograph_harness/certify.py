@@ -32,6 +32,9 @@ from cartograph_harness.readiness import (
 from cartograph_harness.scorer_manifest import (
     build_manifest, fingerprint_certificate_body,
 )
+from cartograph_harness.demo_env import (
+    probe_demo_env, is_demo_env_healthy, env_health_summary,
+)
 
 
 @dataclass
@@ -355,6 +358,29 @@ def _run_negative_controls() -> SuiteResult:
 # ── Orchestrator ──────────────────────────────────────────────────────
 
 
+def _run_demo_env() -> SuiteResult:
+    """Probe required demo modules. Failures count as WARNINGS (env-only),
+    not blockers — the host being unhealthy is a real-world signal that
+    bumps readiness back, but it doesn't mean the harness CODE failed."""
+    res = SuiteResult(suite="demo_env", timestamp=_ts())
+    probe = probe_demo_env()
+    for name, r in probe.items():
+        res.total += 1
+        if r["ok"]:
+            res.passed_count += 1
+            res.evidence[f"{name}_importable"] = True
+            res.evidence[f"{name}_version"] = r.get("version", "?")
+        else:
+            res.warning_count += 1
+            res.warnings.append(f"SKIP: {name}: {r.get('reason', '?')}")
+            res.evidence[f"{name}_importable"] = False
+    res.evidence["demo_env_healthy"] = all(
+        r["ok"] for r in probe.values()
+    )
+    res.passed = (res.failed_count == 0)   # warnings don't fail
+    return res
+
+
 def _derive_readiness(report: CertificationReport) -> tuple[str, str]:
     """Walk the suites bottom-up. The highest rung whose evidence is
     fully satisfied becomes the assigned readiness. Higher rungs require
@@ -422,7 +448,7 @@ def _derive_readiness(report: CertificationReport) -> tuple[str, str]:
 
 
 class CartographConformanceCertification:
-    def __init__(self, tool_version: str = "0.9.0"):
+    def __init__(self, tool_version: str = "0.9.1"):
         self.tool_version = tool_version
 
     def run_suite(self) -> CertificationReport:
@@ -437,6 +463,7 @@ class CartographConformanceCertification:
         report.results.append(_run_query_safety())           # rung 3
         report.results.append(_run_agent_safety())           # rung 4
         report.results.append(_run_recommendation_grounding())
+        report.results.append(_run_demo_env())               # rung 5 gate
         report.results.append(_run_negative_controls())      # LAST gate
         # Derive readiness from evidence — not from assertion
         report.readiness, report.readiness_reason = _derive_readiness(report)

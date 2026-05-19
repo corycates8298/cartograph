@@ -44,15 +44,22 @@ def test_every_rung_has_evidence_gate():
 def report():
     """Run the full suite once — expensive (kicks off pytest subprocesses).
     Reused across all assertions in this file."""
-    cert = CartographConformanceCertification(tool_version="test")
+    cert = CartographConformanceCertification(tool_version="0.9.1-test")
     return cert.run_suite()
 
 
-def test_six_suites_run(report):
+def test_seven_suites_run(report):
+    """7 suites total (was 6 — added demo_env gate 2026-05-19 per ChatGPT)."""
     suite_names = [r.suite for r in report.results]
-    assert len(suite_names) == 6
+    assert len(suite_names) == 7
     # Order matters — negative_controls LAST
     assert suite_names[-1] == "negative_controls"
+
+
+def test_demo_env_suite_present(report):
+    """DEMO_ENV_HEALTHY gate must be a real suite (rung-5 evidence)."""
+    suite_names = [r.suite for r in report.results]
+    assert "demo_env" in suite_names
 
 
 def test_data_model_suite_passes(report):
@@ -139,7 +146,7 @@ def test_label_says_failed_when_a_suite_fails(report, monkeypatch):
     from dataclasses import replace
     from cartograph_harness.certify import CertificationReport, SuiteResult
     fake = CertificationReport(
-        tool_version="test",
+        tool_version="0.9.1-test",
         issued_at="test",
         results=[SuiteResult(suite="data_model", passed=False, failed_count=1,
                               failures=["synthetic"]),
@@ -148,6 +155,61 @@ def test_label_says_failed_when_a_suite_fails(report, monkeypatch):
     )
     assert "FAILED" in fake.label()
     assert "CERTIFIED" not in fake.label()
+
+
+def test_demo_env_probe_returns_structured_results():
+    """probe_demo_env returns one entry per required module with ok/version
+    or ok=False+reason. Pure-function test — doesn't need healthy env."""
+    from cartograph_harness.demo_env import probe_demo_env, REQUIRED_DEMO_MODULES
+    probe = probe_demo_env()
+    assert len(probe) == len(REQUIRED_DEMO_MODULES)
+    for name, _ in REQUIRED_DEMO_MODULES:
+        assert name in probe
+        entry = probe[name]
+        assert "ok" in entry
+        if entry["ok"]:
+            assert "version" in entry
+        else:
+            assert "reason" in entry
+            # Reason must be informative — no silent skips
+            assert len(entry["reason"]) > 5
+
+
+def test_env_health_summary_is_informative():
+    """The certificate-body one-liner must clearly state pass/fail."""
+    from cartograph_harness.demo_env import env_health_summary
+    s = env_health_summary()
+    assert "DEMO_ENV_HEALTHY" in s or "DEMO_ENV_UNHEALTHY" in s
+
+
+def test_demo_env_suite_records_evidence(report):
+    """The demo_env suite must produce evidence keys per module — even
+    when modules fail, the failure shows up as evidence=False."""
+    demo = next(r for r in report.results if r.suite == "demo_env")
+    # Every required module should produce an _importable evidence key
+    for name in ("numpy", "pandas", "sentence_transformers", "duckdb",
+                  "anthropic"):
+        assert f"{name}_importable" in demo.evidence
+
+
+def test_cross_sell_template_no_longer_uses_split_part_name_match():
+    """ChatGPT 2026-05-19 backlog item: cross_sell_fragrance template
+    used SPLIT_PART(a.fragrance, ' ', 1) to fuzzy-match name tokens — that
+    directly contradicts Cartograph's embedding-similarity pitch. The
+    template now does exact-match only; embedding-based similarity is
+    routed through the agent.
+
+    Source-level guard: SPLIT_PART must not return in the CLI templates."""
+    from cartograph.cli import TEMPLATES
+    sql = TEMPLATES["cross_sell_fragrance"]["sql"]
+    assert "SPLIT_PART" not in sql, (
+        "cross_sell_fragrance template reintroduced SPLIT_PART name-token "
+        "matching — use exact-fragrance match here; route similarity-aware "
+        "cross-sell through the agent's cross_sell_analysis tool instead"
+    )
+    assert "ILIKE" not in sql.upper() or "%" not in sql, (
+        "fuzzy ILIKE pattern remains in template SQL"
+    )
 
 
 def test_not_claimed_rungs_remain_unclaimable_on_this_host(report):
