@@ -23,10 +23,10 @@
   .wrap { max-width: 880px; margin: 0 auto; padding: 56px 24px 96px; }
   header { display: flex; align-items: baseline; gap: 14px; margin-bottom: 8px; }
   h1 { font-size: 44px; margin: 0; letter-spacing: -0.02em; }
+  @media (max-width: 480px) { h1 { font-size: 32px; } .lede { font-size: 17px; } }
   .tag { color: var(--muted); font-size: 14px; padding: 4px 10px; border: 1px solid var(--line); border-radius: 999px; }
   .lede { font-size: 20px; color: var(--muted); margin: 8px 0 36px; max-width: 70ch; }
   h2 { font-size: 22px; margin: 40px 0 12px; letter-spacing: -0.01em; }
-  h3 { font-size: 16px; margin: 18px 0 8px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; }
   blockquote {
     margin: 0 0 28px;
     padding: 16px 20px;
@@ -56,9 +56,6 @@
   .card p { margin: 0; color: var(--muted); font-size: 13px; }
   .pill { display: inline-block; padding: 2px 8px; font-size: 12px; border-radius: 999px; background: rgba(74,222,128,.12); color: var(--good); border: 1px solid rgba(74,222,128,.3); }
   footer { margin-top: 56px; padding-top: 20px; border-top: 1px solid var(--line); color: var(--muted); font-size: 13px; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
-  ul { padding-left: 22px; }
-  li { margin: 4px 0; }
-  .kbd { font-family: ui-monospace, monospace; background: #0e1219; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; padding: 1px 6px; font-size: 12px; }
 </style>
 </head>
 <body>
@@ -89,7 +86,7 @@
   </p>
 
   <h2>Architecture</h2>
-  <pre class="arch"><code>┌─────────────────────────────────────────────────────────────┐
+  <pre class="arch" role="img" aria-label="Architecture diagram: a natural-language query to 'cartograph ask' fans out to three components — a Claude Agent for tool-use, DuckDB for SQL cohorts and joins, and an embedding layer for 51 scent vectors and cosine similarity — then converges into a single answer with a recommended next-step action."><code>┌─────────────────────────────────────────────────────────────┐
 │                    cartograph ask                            │
 │         "how many body lotion buyers also bought             │
 │          laundry soap in a similar fragrance?"               │
